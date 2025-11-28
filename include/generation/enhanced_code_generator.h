@@ -1,117 +1,60 @@
 #pragma once
 #include "aod/enhanced_aod_graph.h"
-#include "analysis/integrated_cpg_analyzer.h"
-#include "conversion/enhanced_cpg_to_aod_converter.h"
 #include "aod/optimization_rule_system.h"
+#include "conversion/enhanced_cpg_to_aod_converter.h"
+#include "clang/AST/ASTContext.h"
 
 #include <memory>
 #include <map>
-#include <set>
 #include <vector>
 #include <string>
-#include <sstream>
 
 namespace aodsolve {
 
 struct CodeGenerationResult {
     bool successful = false;
     std::string generated_code;
-    std::vector<std::string> warnings;
-    std::vector<std::string> info_messages;
-    std::vector<std::string> optimization_applied;
-    std::map<std::string, std::string> variable_mapping;
     double estimated_speedup = 0.0;
-    std::string target_architecture;
-    int vector_operations = 0;
-    int total_operations = 0;
-    double memory_access_efficiency = 0.0;
-    int lines_of_code = 0;
-    int functions_generated = 0;
     int simd_intrinsics = 0;
-    int loops_optimized = 0;
-    int dead_code_eliminated = 0;
+    std::vector<std::string> info_messages;
+    std::string target_architecture;
 };
 
 class EnhancedCodeGenerator {
 private:
+    clang::ASTContext& ast_context;
     std::string target_architecture;
-    int optimization_level;
-    bool enable_vectorization;
-    bool enable_interprocedural_optimization;
-    bool preserve_debug_info;
-
-    std::map<std::string, std::function<std::string(const std::shared_ptr<AODNode>&)>> node_templates;
-    std::map<AODNodeType, std::string> node_type_to_template;
-    std::map<std::string, std::string> intrinsic_mappings;
-
-    std::map<std::string, std::string> variable_renaming;
-    std::set<std::string> reserved_names;
-    int variable_counter = 0;
-
-    std::stringstream current_code;
-    int indent_level = 0;
-    bool in_function = false;
-    std::string current_function_name;
-
-    // ===== 新增: 规则库指针 =====
     RuleDatabase* rule_db = nullptr;
 
+    std::map<const clang::Stmt*, std::shared_ptr<AODNode>> stmt_map;
+    std::shared_ptr<AODGraph> current_graph;
+
 public:
-    explicit EnhancedCodeGenerator(const std::string& arch = "AVX2", int opt_level = 2);
     explicit EnhancedCodeGenerator(clang::ASTContext& ctx);
     ~EnhancedCodeGenerator() = default;
 
-    // 设置规则库
+    void setTargetArchitecture(const std::string& arch) { target_architecture = arch; }
     void setRuleDatabase(RuleDatabase* db) { rule_db = db; }
 
-    CodeGenerationResult generateCodeFromGraph(const AODGraphPtr& graph);
-    CodeGenerationResult generateCodeFromConversion(const ConversionResult& conversion);
-
-    std::shared_ptr<AODGraph> buildSimpleAODGraphFromBindings(
-    const std::map<std::string, std::string>& bindings);
-
-    std::string generateLoopFromTemplate(
-    const std::map<std::string, std::string>& bindings,
-    const std::string& target_arch);
-
-    // ===== 核心方法: 从AOD图生成向量化循环 =====
-    std::string generateVectorizedLoopFromAOD(
-    const AODGraphPtr& aod_graph,
-    const std::map<std::string, std::string>& loop_context,
-    const std::string& target_arch);
-
-    // // ===== 从模板生成循环(用于demo) =====
-    // std::string generateLoopFromTemplate(
-    //     const std::map<std::string, std::string>& bindings,
-    //     const std::string& target_arch);
-    //     const AODGraphPtr& aod_graph,
-    //     const std::map<std::string, std::string>& loop_context,
-    //     const std::string& target_arch);
-
-    // ===== 从算子生成SIMD指令 =====
-    std::string generateSIMDInstructionForOperator(
-        std::shared_ptr<AODNode> op_node,
-        const std::map<std::string, std::string>& bindings,
-        const std::string& target_arch);
-
-    void setTargetArchitecture(const std::string& arch) { target_architecture = arch; }
-    void setOptimizationLevel(int level) { optimization_level = level; }
-
-    std::string formatCode(const std::string& code);
-    // ===== 从AOD节点推断算子类型 =====
-    // std::string inferOperatorType(const std::shared_ptr<AODNode>& node);
-    std::string inferOperatorType(std::shared_ptr<AODNode> node);
+    CodeGenerationResult generate(const clang::FunctionDecl* func, const ConversionResult& conv_res);
+    CodeGenerationResult generateCodeFromGraph(const std::shared_ptr<AODGraph>& graph);
+    std::string generateLoopFromTemplate(const std::map<std::string, std::string>&, const std::string&) { return ""; }
 
 private:
-    void initializeNodeTemplates();
-    void initializeIntrinsicMappings();
+    // 修复参数默认值
+    void traverseAST(const clang::Stmt* stmt, std::stringstream& code, bool force_scalar = false);
 
+    std::string generateFromAOD(const std::shared_ptr<AODNode>& node, const std::shared_ptr<AODGraph>& graph);
+    std::string tryApplyRules(const std::shared_ptr<AODNode>& node, const std::shared_ptr<AODGraph>& graph);
+    std::string generateDefineNode(const std::shared_ptr<AODNode>& node, const std::shared_ptr<AODGraph>& graph);
 
+    std::string generateFallbackCode(const clang::Stmt* stmt);
+    std::string generateOutputVar(const std::shared_ptr<AODNode>& node);
+    bool needsSemicolon(const clang::Stmt* stmt);
 
-    // ===== 查找匹配的SIMD规则 =====
-    OptimizationRule* findMatchingSIMDRule(
-        const std::string& operator_type,
-        const std::string& target_arch);
+    const OptimizationRule* getRuleForNode(const std::shared_ptr<AODNode>& node);
+    std::string getReturnTypeFromRule(const std::shared_ptr<AODNode>& node);
+    std::string applyReplacements(std::string code, const TransformTemplate& tmpl);
 };
 
 } // namespace aodsolve
