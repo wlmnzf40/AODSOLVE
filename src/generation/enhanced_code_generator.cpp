@@ -1,486 +1,350 @@
 #include "generation/enhanced_code_generator.h"
-#include <algorithm>
 #include <sstream>
+#include <iostream>
+#include <clang/AST/Stmt.h>
+#include <clang/AST/Expr.h>
+#include <clang/AST/Decl.h>
 
 namespace aodsolve {
 
-EnhancedCodeGenerator::EnhancedCodeGenerator(clang::ASTContext& /*ctx*/)
-    : target_architecture("AVX2"), optimization_level(2), enable_vectorization(true),
-      enable_interprocedural_optimization(true), preserve_debug_info(false) {
-    initializeNodeTemplates();
+EnhancedCodeGenerator::EnhancedCodeGenerator(clang::ASTContext& ctx)
+    : ast_context(ctx), target_architecture("SVE") {}
+
+bool EnhancedCodeGenerator::needsSemicolon(const clang::Stmt* stmt) {
+    if (llvm::isa<clang::CompoundStmt>(stmt)) return false;
+    if (llvm::isa<clang::IfStmt>(stmt)) return false;
+    if (llvm::isa<clang::WhileStmt>(stmt)) return false;
+    if (llvm::isa<clang::ForStmt>(stmt)) return false;
+    if (llvm::isa<clang::DeclStmt>(stmt)) return true;
+    return true;
 }
 
-EnhancedCodeGenerator::EnhancedCodeGenerator(const std::string& arch, int opt_level)
-    : target_architecture(arch), optimization_level(opt_level), enable_vectorization(true),
-      enable_interprocedural_optimization(true), preserve_debug_info(false) {
-    initializeNodeTemplates();
-}
+CodeGenerationResult EnhancedCodeGenerator::generateCodeFromGraph(const std::shared_ptr<AODGraph>& graph) { return {}; }
 
-void EnhancedCodeGenerator::initializeNodeTemplates() {
-    intrinsic_mappings["_mm_load_ps"] = "_mm_load_ps";
-    intrinsic_mappings["_mm_add_ps"] = "_mm_add_ps";
-    intrinsic_mappings["_mm_mul_ps"] = "_mm_mul_ps";
-
-    reserved_names.insert("if");
-    reserved_names.insert("for");
-    reserved_names.insert("while");
-    reserved_names.insert("return");
-}
-
-void EnhancedCodeGenerator::initializeIntrinsicMappings() {
-    // 初始化SIMD内部函数映射
-}
-
-CodeGenerationResult EnhancedCodeGenerator::generateCodeFromGraph(const AODGraphPtr& /*graph*/) {
+CodeGenerationResult EnhancedCodeGenerator::generate(const clang::FunctionDecl* func, const ConversionResult& conv_res) {
     CodeGenerationResult result;
-    result.successful = true;
-    result.generated_code = "// 优化后的代码\n";
-    result.estimated_speedup = 2.0;
-    result.target_architecture = target_architecture;
-    return result;
-}
-
-CodeGenerationResult EnhancedCodeGenerator::generateCodeFromConversion(const ConversionResult& /*conversion*/) {
-    CodeGenerationResult result;
-    result.successful = true;
-    result.target_architecture = target_architecture;
-    return result;
-}
-
-// ============================================================================
-// 核心实现: 从AOD图生成向量化循环
-// ============================================================================
-
-std::string EnhancedCodeGenerator::generateVectorizedLoopFromAOD(
-    const AODGraphPtr& aod_graph,
-    const std::map<std::string, std::string>& loop_context,
-    const std::string& target_arch) {
-
-    if (!aod_graph) {
-        return "// Error: No AOD graph\n";
-    }
-
+    stmt_map = conv_res.stmt_to_node_ptr_map;
+    current_graph = conv_res.aod_graph;
     std::stringstream code;
 
-    // 从loop_context提取循环信息
-    std::string loop_var = loop_context.count("loop_var") ? loop_context.at("loop_var") : "j";
-    std::string start_val = loop_context.count("start_value") ? loop_context.at("start_value") : "0";
-    std::string end_val = loop_context.count("end_value") ? loop_context.at("end_value") : "ny";
-    std::string func_name = loop_context.count("function_name") ? loop_context.at("function_name") : "vectorized_func";
+    if (func->hasBody()) traverseAST(func->getBody(), code, false);
 
-    // 确定向量宽度
-    int vector_width = (target_arch == "NEON") ? 4 : 0;
+    result.generated_code = code.str();
+    result.successful = true;
+    stmt_map.clear();
+    current_graph.reset();
+    return result;
+}
 
-    // 生成函数签名
-    code << "void " << func_name << "_" << target_arch << "(float volatile* xNorms, int i, float volatile* yNorms,\n";
-    code << "               float volatile* ipLine, size_t " << end_val << ") {\n";
+std::string getLoopVarName(const clang::Stmt* inc) {
+    if (!inc) return "";
+    if (auto* uo = llvm::dyn_cast<clang::UnaryOperator>(inc)) {
+        if (auto* dre = llvm::dyn_cast<clang::DeclRefExpr>(uo->getSubExpr()->IgnoreParenCasts()))
+            return dre->getDecl()->getNameAsString();
+    }
+    else if (auto* bo = llvm::dyn_cast<clang::BinaryOperator>(inc)) { // i += 1
+        if (auto* dre = llvm::dyn_cast<clang::DeclRefExpr>(bo->getLHS()->IgnoreParenCasts()))
+            return dre->getDecl()->getNameAsString();
+    }
+    else if (auto* cao = llvm::dyn_cast<clang::CompoundAssignOperator>(inc)) { // i += 1
+         if (auto* dre = llvm::dyn_cast<clang::DeclRefExpr>(cao->getLHS()->IgnoreParenCasts()))
+             return dre->getDecl()->getNameAsString();
+    }
+    return "";
+}
 
-    // 生成初始化代码
-    if (target_arch == "NEON") {
-        code << "    float xNorm_scalar = xNorms[i];\n";
-        code << "    size_t " << loop_var << " = " << start_val << ";\n\n";
-        code << "    // 主向量化循环 (" << vector_width << " lanes)\n";
-        code << "    for (; " << loop_var << " + " << vector_width << " <= " << end_val << "; "
-             << loop_var << " += " << vector_width << ") {\n";
-    } else if (target_arch == "SVE") {
-        code << "    float xNorm_scalar = xNorms[i];\n";
-        code << "    svbool_t pg = svptrue_b32();\n";
-        code << "    uint64_t vl = svcntw();\n";
-        code << "    size_t " << loop_var << " = " << start_val << ";\n\n";
-        code << "    // 主向量化循环 (可伸缩)\n";
-        code << "    while (" << loop_var << " + vl <= " << end_val << ") {\n";
+int getVectorWidth(const clang::Stmt* stmt, const std::map<const clang::Stmt*, std::shared_ptr<AODNode>>& map) {
+    if (!stmt) return 0;
+    int width = 0;
+    auto it = map.find(stmt);
+    if (it != map.end()) {
+        std::string w = it->second->getProperty("vector_width");
+        if (!w.empty()) width = std::max(width, std::stoi(w));
+    }
+    for (const auto* child : stmt->children()) {
+        width = std::max(width, getVectorWidth(child, map));
+    }
+    return width;
+}
+
+void EnhancedCodeGenerator::traverseAST(const clang::Stmt* stmt, std::stringstream& code, bool force_scalar) {
+    if (!stmt) return;
+
+    bool handled_by_aod = false;
+    auto it = stmt_map.find(stmt);
+
+    if (!force_scalar && it != stmt_map.end()) {
+        auto node = it->second;
+        if (node->getProperty("op_name") == "bf16_dot" ||
+            node->getType() == AODNodeType::SIMD_Intrinsic ||
+            node->getProperty("op_name") == "define") {
+            handled_by_aod = true;
+        }
+        if (node->getProperty("vectorize") == "true" && llvm::isa<clang::BinaryOperator>(stmt)) {
+            handled_by_aod = true;
+        }
     }
 
-    // ===== 关键部分: 遍历AOD图生成向量化指令 =====
-    auto sorted_nodes = aod_graph->topologicalSort_v1();
-    // auto sorted_nodes =aod_graph->getTopologicalOrder();
+    if (handled_by_aod) {
+        std::string gen = generateFromAOD(it->second, current_graph);
+        if (!gen.empty()) {
+            code << "    " << gen;
+            if (needsSemicolon(stmt) && gen.back() != ';' && gen.back() != '}') code << ";";
+            code << "\n";
+            return;
+        }
+    }
 
-    for (const auto& node : sorted_nodes) {
-        if (!node) continue;
+    if (auto* compound = llvm::dyn_cast<clang::CompoundStmt>(stmt)) {
+        for (auto* child : compound->body()) traverseAST(child, code, force_scalar);
+    }
+    else if (auto* whileStmt = llvm::dyn_cast<clang::WhileStmt>(stmt)) {
+        std::string cond = generateFallbackCode(whileStmt->getCond());
+        code << "    while (" << cond << ") {\n";
+        traverseAST(whileStmt->getBody(), code, force_scalar);
+        code << "    }\n";
+    }
+    else if (auto* forStmt = llvm::dyn_cast<clang::ForStmt>(stmt)) {
+        std::string init = generateFallbackCode(forStmt->getInit());
+        std::string cond = generateFallbackCode(forStmt->getCond());
+        std::string inc = generateFallbackCode(forStmt->getInc());
+        std::string loop_var = getLoopVarName(forStmt->getInc());
 
-        // 根据AOD节点类型生成对应的SIMD指令
-        AODNodeType node_type = node->getType();
+        int vec_width = 0;
+        if (!force_scalar && (target_architecture == "NEON" || target_architecture == "SVE")) {
+            vec_width = getVectorWidth(forStmt->getBody(), stmt_map);
+        }
 
-        if (node_type == AODNodeType::Load) {
-            // 生成加载指令
-            std::string var_name = node->getAttribute("variable_name");
-            if (var_name.empty()) var_name = node->getName();
+        if (vec_width > 0 || (target_architecture == "SVE" && stmt_map.count(stmt) && stmt_map[stmt]->getProperty("vectorize") == "true")) {
+            std::string step_str = (target_architecture == "SVE") ? "svcntw()" : "4";
+            if (vec_width > 0 && target_architecture == "NEON") step_str = std::to_string(vec_width);
 
-            if (target_arch == "NEON") {
-                code << "        float32x4_t " << var_name << "_vec = vld1q_f32((const float*)("
-                     << var_name << " + " << loop_var << "));\n";
+            std::string vec_cond = cond;
+            size_t lt = vec_cond.find('<');
+            // NEON 需要预留 Tail
+            if (target_architecture == "NEON" && lt != std::string::npos) {
+                std::string lhs = vec_cond.substr(0, lt);
+                std::string rhs = vec_cond.substr(lt + 1);
+                vec_cond = lhs + " + " + step_str + " <= " + rhs;
+            }
+
+            // [修复] 正确构造步长
+            std::string vec_inc = inc;
+            if (!loop_var.empty()) vec_inc = loop_var + " += " + step_str;
+
+            code << "    // Vector Loop\n";
+            code << "    for (" << init << "; " << vec_cond << "; " << vec_inc << ") {\n";
+
+            if (target_architecture == "SVE") {
+                std::string bound = "n";
+                if (lt != std::string::npos) bound = cond.substr(lt + 1);
+                code << "        pg = svwhilelt_b32(" << (loop_var.empty()?"i":loop_var) << ", " << bound << ");\n";
+            }
+
+            traverseAST(forStmt->getBody(), code, false);
+            code << "    }\n";
+
+            if (target_architecture != "SVE") {
+                code << "    // Tail Loop\n";
+                code << "    for (; " << cond << "; " << inc << ") {\n";
+                traverseAST(forStmt->getBody(), code, true);
+                code << "    }\n";
+            }
+
+        } else {
+            code << "    for (" << init << "; " << cond << "; " << inc << ") {\n";
+            traverseAST(forStmt->getBody(), code, force_scalar);
+            code << "    }\n";
+        }
+    }
+    else if (auto* ifStmt = llvm::dyn_cast<clang::IfStmt>(stmt)) {
+        std::string cond = generateFallbackCode(ifStmt->getCond());
+        code << "    if (" << cond << ") {\n";
+        traverseAST(ifStmt->getThen(), code, force_scalar);
+        code << "    }\n";
+        if (ifStmt->getElse()) {
+            code << "    else {\n";
+            traverseAST(ifStmt->getElse(), code, force_scalar);
+            code << "    }\n";
+        }
+    }
+    else {
+        code << "    " << generateFallbackCode(stmt) << ";\n";
+    }
+}
+
+std::string EnhancedCodeGenerator::generateFromAOD(const std::shared_ptr<AODNode>& node, const std::shared_ptr<AODGraph>& graph) {
+    if (!rule_db) return "";
+
+    if (node->getProperty("op_name") == "define") {
+        return generateDefineNode(node, graph);
+    }
+
+    if (node->getProperty("op_name") == "bf16_dot") {
+        auto* rule = rule_db->findRuleForOp("bf16_dot");
+        if (rule && rule->target_templates.count(target_architecture)) {
+            auto tmpl = rule->target_templates.at(target_architecture);
+            std::string code = tmpl.code_template;
+            std::map<std::string, std::string> bindings;
+            bindings["{{accum_var}}"] = node->getProperty("accum_var");
+            bindings["{{input_0}}"] = node->getProperty("base_x");
+            bindings["{{input_1}}"] = node->getProperty("base_y");
+            for (auto& kv : bindings) {
+                size_t pos;
+                while ((pos = code.find(kv.first)) != std::string::npos) code.replace(pos, kv.first.length(), kv.second);
+            }
+            return code;
+        }
+    }
+
+    std::string op_name = node->getProperty("op_name");
+    const OptimizationRule* rule = getRuleForNode(node);
+
+    if (!rule || rule->target_templates.find(target_architecture) == rule->target_templates.end()) {
+        return "";
+    }
+
+    const auto& tmpl = rule->target_templates.at(target_architecture);
+    std::string code = tmpl.code_template;
+    std::map<std::string, std::string> bindings;
+
+    auto edges = graph->getIncomingEdges(node->getId());
+
+    const clang::Expr* expr_ptr = llvm::dyn_cast_or_null<clang::Expr>(node->getAstStmt());
+    if (expr_ptr) {
+        if (auto* call = llvm::dyn_cast<clang::CallExpr>(expr_ptr->IgnoreParenCasts())) {
+            for (unsigned i = 0; i < call->getNumArgs(); ++i) {
+                bindings["{{input_" + std::to_string(i) + "}}"] = generateFallbackCode(call->getArg(i));
+            }
+        } else if (auto* bo = llvm::dyn_cast<clang::BinaryOperator>(expr_ptr->IgnoreParenCasts())) {
+            bindings["{{input_0}}"] = generateFallbackCode(bo->getLHS());
+            bindings["{{input_1}}"] = generateFallbackCode(bo->getRHS());
+        }
+    }
+
+    for (auto& edge : edges) {
+        std::string var = edge->getProperties().variable_name;
+        if (var.find("arg_") == 0) {
+            int idx = std::stoi(var.substr(4));
+            auto src = edge->getSource();
+            std::string val;
+
+            if (src->getProperty("op_name") == "define") {
+                val = src->getProperty("var_name");
             } else {
-                code << "        svfloat32_t " << var_name << "_vec = svld1_f32(pg, "
-                     << var_name << " + " << loop_var << ");\n";
+                val = generateFromAOD(src, graph);
             }
-        }
-        else if (node_type == AODNodeType::Add || node_type == AODNodeType::Subtract ||
-                 node_type == AODNodeType::Multiply) {
-            // 生成算术指令
-            auto input_edges = aod_graph->getIncomingEdges(node->getId());
-            if (input_edges.size() >= 2) {
-                std::string input0 = input_edges[0]->getSource()->getName();
-                std::string input1 = input_edges[1]->getSource()->getName();
-                std::string output = node->getName();
 
-                std::map<std::string, std::string> op_bindings;
-                op_bindings["input_0"] = input0;
-                op_bindings["input_1"] = input1;
-                op_bindings["output"] = output;
-
-                std::string simd_code = generateSIMDInstructionForOperator(node, op_bindings, target_arch);
-                code << "        " << simd_code << "\n";
+            if (target_architecture == "SVE" && op_name.find("and") != std::string::npos && src->getProperty("op_name").find("cmp") != std::string::npos) {
+                val = "svsel_s8(" + val + ", svdup_s8(0xFF), svdup_s8(0x00))";
             }
-        }
-        else if (node_type == AODNodeType::GreaterThan || node_type == AODNodeType::LessThan) {
-            // 条件比较 -> max/min优化
-            auto input_edges = aod_graph->getIncomingEdges(node->getId());
-            if (input_edges.size() >= 2) {
-                std::string input0 = input_edges[0]->getSource()->getName();
-                std::string input1 = input_edges[1]->getSource()->getName();
-                std::string output = node->getName();
+            size_t pos;
+            while ((pos = val.find("(__m256i *)")) != std::string::npos) val.replace(pos, 11, "(int8_t *)");
 
-                if (target_arch == "NEON") {
-                    code << "        float32x4_t " << output << "_vec = vmaxq_f32("
-                         << input0 << "_vec, " << input1 << "_vec);\n";
-                } else {
-                    code << "        svfloat32_t " << output << "_vec = svmax_f32_z(pg, "
-                         << input0 << "_vec, " << input1 << "_vec);\n";
-                }
-            }
-        }
-        else if (node_type == AODNodeType::Store) {
-            // 生成存储指令
-            std::string var_name = node->getAttribute("variable_name");
-            if (var_name.empty()) var_name = node->getName();
-
-            auto input_edges = aod_graph->getIncomingEdges(node->getId());
-            if (!input_edges.empty()) {
-                std::string source = input_edges[0]->getSource()->getName();
-                if (target_arch == "NEON") {
-                    code << "        vst1q_f32((float*)(" << var_name << " + " << loop_var
-                         << "), " << source << "_vec);\n";
-                } else {
-                    code << "        svst1_f32(pg, " << var_name << " + " << loop_var
-                         << ", " << source << "_vec);\n";
-                }
-            }
+            bindings["{{input_" + std::to_string(idx) + "}}"] = val;
         }
     }
 
-    // 循环结束
-    if (target_arch == "NEON") {
-        code << "    }\n\n";
-        // 标量尾部处理
-        code << "    // 标量尾部处理\n";
-        code << "    for (; " << loop_var << " < " << end_val << "; " << loop_var << "++) {\n";
-        code << "        float ip = ipLine[" << loop_var << "];\n";
-        code << "        float dis = xNorm_scalar + yNorms[" << loop_var << "] - 2 * ip;\n";
-        code << "        if (dis < 0) dis = 0;\n";
-        code << "        ipLine[" << loop_var << "] = dis;\n";
-        code << "    }\n";
-    } else if (target_arch == "SVE") {
-        code << "        " << loop_var << " += vl;\n";
-        code << "    }\n\n";
-        code << "    // 尾部处理 (使用predicate)\n";
-        code << "    if (" << loop_var << " < " << end_val << ") {\n";
-        code << "        svbool_t pg_tail = svwhilelt_b32(" << loop_var << ", " << end_val << ");\n";
-        code << "        svfloat32_t yNorm_vec = svld1_f32(pg_tail, yNorms + " << loop_var << ");\n";
-        code << "        svfloat32_t ip_vec = svld1_f32(pg_tail, ipLine + " << loop_var << ");\n";
-        code << "        svfloat32_t xNorm_vec = svdup_n_f32(xNorm_scalar);\n";
-        code << "        svfloat32_t dis_vec = svadd_f32_z(pg_tail, xNorm_vec, yNorm_vec);\n";
-        code << "        dis_vec = svsub_f32_z(pg_tail, dis_vec, svmul_n_f32_z(pg_tail, ip_vec, 2.0f));\n";
-        code << "        dis_vec = svmax_n_f32_z(pg_tail, dis_vec, 0.0f);\n";
-        code << "        svst1_f32(pg_tail, ipLine + " << loop_var << ", dis_vec);\n";
-        code << "    }\n";
+    if (target_architecture == "SVE") bindings["{{predicate}}"] = "pg";
+
+    for (const auto& [k, v] : bindings) {
+        size_t pos;
+        while ((pos = code.find(k)) != std::string::npos) code.replace(pos, k.length(), v);
     }
-
-    code << "}\n";
-
-    return code.str();
-}
-
-// ============================================================================
-// 从bindings构建简单的AOD图 (用于demo)
-// ============================================================================
-
-std::shared_ptr<AODGraph> EnhancedCodeGenerator::buildSimpleAODGraphFromBindings(
-    const std::map<std::string, std::string>& bindings) {
-
-    auto graph = std::make_shared<AODGraph>("demo_loop");
-
-    // 创建Load节点
-    auto load_xNorm = std::make_shared<AODLoadNode>("xNorms[i]", "float");
-    auto load_yNorm = std::make_shared<AODLoadNode>("yNorms", "float");
-    auto load_ip = std::make_shared<AODLoadNode>("ipLine", "float");
-
-    graph->addNode(load_xNorm);
-    graph->addNode(load_yNorm);
-    graph->addNode(load_ip);
-
-    // 创建算术节点: dis = xNorm + yNorm - 2 * ip
-    // 步骤1: 2 * ip
-    auto const_2 = std::make_shared<AODNode>(AODNodeType::Constant, "const_2");
-    const_2->setProperty("value", "2.0");
-    graph->addNode(const_2);
-
-    auto mul_node = std::make_shared<AODArithmeticNode>(AODNodeType::Multiply, "mul", "float");
-    graph->addNode(mul_node);
-    graph->addEdge(load_ip, mul_node, AODEdgeType::Data);
-    graph->addEdge(const_2, mul_node, AODEdgeType::Data);
-
-    // 步骤2: xNorm + yNorm
-    auto add_node = std::make_shared<AODArithmeticNode>(AODNodeType::Add, "add", "float");
-    graph->addNode(add_node);
-    graph->addEdge(load_xNorm, add_node, AODEdgeType::Data);
-    graph->addEdge(load_yNorm, add_node, AODEdgeType::Data);
-
-    // 步骤3: (xNorm + yNorm) - (2 * ip)
-    auto sub_node = std::make_shared<AODArithmeticNode>(AODNodeType::Subtract, "sub", "float");
-    sub_node->setName("dis");
-    graph->addNode(sub_node);
-    graph->addEdge(add_node, sub_node, AODEdgeType::Data);
-    graph->addEdge(mul_node, sub_node, AODEdgeType::Data);
-
-    // 步骤4: if (dis < 0) dis = 0  =>  dis = max(dis, 0)
-    auto const_0 = std::make_shared<AODNode>(AODNodeType::Constant, "const_0");
-    const_0->setProperty("value", "0.0");
-    graph->addNode(const_0);
-
-    auto max_node = std::make_shared<AODNode>(AODNodeType::GreaterThan, "max");
-    graph->addNode(max_node);
-    graph->addEdge(sub_node, max_node, AODEdgeType::Data);
-    graph->addEdge(const_0, max_node, AODEdgeType::Data);
-
-    // 步骤5: Store
-    auto store_node = std::make_shared<AODStoreNode>("ipLine", "float");
-    graph->addNode(store_node);
-    graph->addEdge(max_node, store_node, AODEdgeType::Data);
-
-    return graph;
-}
-
-// ============================================================================
-// 从bindings生成代码 - 通过构建AOD图实现
-// ============================================================================
-
-std::string EnhancedCodeGenerator::generateLoopFromTemplate(
-    const std::map<std::string, std::string>& bindings,
-    const std::string& target_arch) {
-
-    // 1. 从bindings构建AOD图
-    auto aod_graph = buildSimpleAODGraphFromBindings(bindings);
-
-    // 2. 使用现有的generateVectorizedLoopFromAOD方法
-    std::map<std::string, std::string> loop_context;
-    loop_context["loop_var"] = bindings.count("{{loop_var}}") ?
-        bindings.at("{{loop_var}}") : "j";
-    loop_context["start_value"] = bindings.count("{{start_value}}") ?
-        bindings.at("{{start_value}}") : "0";
-    loop_context["end_value"] = bindings.count("{{end_value}}") ?
-        bindings.at("{{end_value}}") : "ny";
-    loop_context["function_name"] = "Test";
-
-    // 3. 调用基于AOD图的生成方法
-    return generateVectorizedLoopFromAOD(aod_graph, loop_context, target_arch);
-}
-
-
-
-// ============================================================================
-// 从算子生成SIMD指令
-// ============================================================================
-
-std::string EnhancedCodeGenerator::generateSIMDInstructionForOperator(
-    std::shared_ptr<AODNode> op_node,
-    const std::map<std::string, std::string>& bindings,
-    const std::string& target_arch) {
-
-    if (!op_node) {
-        return "// Error: Invalid operator node\n";
-    }
-
-    // 根据节点类型直接生成(不依赖规则库,简化实现)
-    AODNodeType op_type = op_node->getType();
-
-    std::string input0 = bindings.count("input_0") ? bindings.at("input_0") : "in0";
-    std::string input1 = bindings.count("input_1") ? bindings.at("input_1") : "in1";
-    std::string output = bindings.count("output") ? bindings.at("output") : "out";
-
-    std::stringstream code;
-
-    if (target_arch == "NEON") {
-        if (op_type == AODNodeType::Add) {
-            code << "float32x4_t " << output << "_vec = vaddq_f32(" << input0 << "_vec, " << input1 << "_vec);";
-        } else if (op_type == AODNodeType::Subtract) {
-            code << "float32x4_t " << output << "_vec = vsubq_f32(" << input0 << "_vec, " << input1 << "_vec);";
-        } else if (op_type == AODNodeType::Multiply) {
-            code << "float32x4_t " << output << "_vec = vmulq_f32(" << input0 << "_vec, " << input1 << "_vec);";
-        }
-    } else if (target_arch == "SVE") {
-        if (op_type == AODNodeType::Add) {
-            code << "svfloat32_t " << output << "_vec = svadd_f32_z(pg, " << input0 << "_vec, " << input1 << "_vec);";
-        } else if (op_type == AODNodeType::Subtract) {
-            code << "svfloat32_t " << output << "_vec = svsub_f32_z(pg, " << input0 << "_vec, " << input1 << "_vec);";
-        } else if (op_type == AODNodeType::Multiply) {
-            code << "svfloat32_t " << output << "_vec = svmul_f32_z(pg, " << input0 << "_vec, " << input1 << "_vec);";
-        }
-    }
-
-    return code.str();
-}
-
-// ============================================================================
-// 辅助方法: 从AOD节点推断算子类型
-// ============================================================================
-
-std::string EnhancedCodeGenerator::inferOperatorType(std::shared_ptr<AODNode> node) {
-    if (!node) return "unknown";
-
-    // 根据AOD节点类型推断
-    AODNodeType node_type = node->getType();
-
-    switch (node_type) {
-        case AODNodeType::Load: return "load";
-        case AODNodeType::Store: return "store";
-        case AODNodeType::Add: return "add";
-        case AODNodeType::Subtract: return "sub";
-        case AODNodeType::Multiply: return "mul";
-        case AODNodeType::Divide: return "div";
-        case AODNodeType::LessThan:
-        case AODNodeType::GreaterThan:
-        case AODNodeType::Equal:
-            return "compare";
-        default:
-            break;
-    }
-
-    // 根据节点名称推断
-    std::string node_name = node->getName();
-    std::transform(node_name.begin(), node_name.end(), node_name.begin(), ::tolower);
-
-    if (node_name.find("load") != std::string::npos) return "load";
-    if (node_name.find("store") != std::string::npos) return "store";
-    if (node_name.find("add") != std::string::npos || node_name.find("+") != std::string::npos) return "add";
-    if (node_name.find("sub") != std::string::npos || node_name.find("-") != std::string::npos) return "sub";
-    if (node_name.find("mul") != std::string::npos || node_name.find("*") != std::string::npos) return "mul";
-    if (node_name.find("div") != std::string::npos || node_name.find("/") != std::string::npos) return "div";
-    if (node_name.find("max") != std::string::npos) return "max";
-    if (node_name.find("min") != std::string::npos) return "min";
-    if (node_name.find("broadcast") != std::string::npos || node_name.find("dup") != std::string::npos) return "broadcast";
-
-    return "unknown";
-}
-
-// ============================================================================
-// 辅助方法: 查找匹配的SIMD规则
-// ============================================================================
-
-OptimizationRule* EnhancedCodeGenerator::findMatchingSIMDRule(
-    const std::string& operator_type,
-    const std::string& target_arch) {
-
-    if (!rule_db) return nullptr;
-
-    // 查询SIMD指令规则
-    auto rules = rule_db->queryRules("simd_instruction");
-
-    for (auto* rule : rules) {
-        // 简单匹配: 规则名称包含算子类型
-        std::string rule_name_lower = rule->rule_name;
-        std::transform(rule_name_lower.begin(), rule_name_lower.end(),
-                      rule_name_lower.begin(), ::tolower);
-
-        if (rule_name_lower.find(operator_type) != std::string::npos) {
-            // 检查是否有目标架构的模板
-            if (rule->target_templates.count(target_arch) > 0) {
-                return rule;
-            }
-        }
-    }
-
-    return nullptr;
-}
-
-std::string EnhancedCodeGenerator::formatCode(const std::string& code) {
     return code;
 }
 
+std::string EnhancedCodeGenerator::generateDefineNode(const std::shared_ptr<AODNode>& node, const std::shared_ptr<AODGraph>& graph) {
+    std::string var_name = node->getProperty("var_name");
+    std::string rhs_code;
 
-//     std::string EnhancedCodeGenerator::generateLoopFromTemplate(
-//     const std::map<std::string, std::string>& bindings,
-//     const std::string& target_arch) {
-//
-//     std::stringstream code;
-//
-//     // 提取绑定变量
-//     std::string loop_var = bindings.count("{{loop_var}}") ? bindings.at("{{loop_var}}") : "j";
-//     std::string start_val = bindings.count("{{start_value}}") ? bindings.at("{{start_value}}") : "0";
-//     std::string end_val = bindings.count("{{end_value}}") ? bindings.at("{{end_value}}") : "ny";
-//
-//     // 函数签名
-//     code << "void Test_" << target_arch << "(float volatile* xNorms, int i, float volatile* yNorms,\n";
-//     code << "               float volatile* ipLine, size_t " << end_val << ") {\n";
-//     code << "    float xNorm_scalar = xNorms[i];\n";
-//     code << "    size_t " << loop_var << " = " << start_val << ";\n\n";
-//
-//     if (target_arch == "NEON") {
-//         // NEON向量化循环
-//         code << "    // Vector loop (NEON: 4 elements)\n";
-//         code << "    for (; " << loop_var << " + 4 <= " << end_val << "; " << loop_var << " += 4) {\n";
-//         code << "        float32x4_t yNorm_vec = vld1q_f32((const float*)(yNorms + " << loop_var << "));\n";
-//         code << "        float32x4_t ip_vec = vld1q_f32((const float*)(ipLine + " << loop_var << "));\n";
-//         code << "        float32x4_t xNorm_vec = vdupq_n_f32(xNorm_scalar);\n";
-//         code << "        float32x4_t two_vec = vdupq_n_f32(2.0f);\n";
-//         code << "        float32x4_t dis_vec = vaddq_f32(xNorm_vec, yNorm_vec);\n";
-//         code << "        dis_vec = vsubq_f32(dis_vec, vmulq_f32(ip_vec, two_vec));\n";
-//         code << "        float32x4_t zero_vec = vdupq_n_f32(0.0f);\n";
-//         code << "        dis_vec = vmaxq_f32(dis_vec, zero_vec);\n";
-//         code << "        vst1q_f32((float*)(ipLine + " << loop_var << "), dis_vec);\n";
-//         code << "    }\n\n";
-//
-//         // Scalar tail
-//         code << "    // Scalar tail\n";
-//         code << "    for (; " << loop_var << " < " << end_val << "; " << loop_var << "++) {\n";
-//         code << "        float ip = ipLine[" << loop_var << "];\n";
-//         code << "        float dis = xNorm_scalar + yNorms[" << loop_var << "] - 2 * ip;\n";
-//         code << "        if (dis < 0) dis = 0;\n";
-//         code << "        ipLine[" << loop_var << "] = dis;\n";
-//         code << "    }\n";
-//
-//     } else if (target_arch == "SVE") {
-//         // SVE向量化循环
-//         code << "    svbool_t pg = svptrue_b32();\n";
-//         code << "    uint64_t vl = svcntw();\n\n";
-//         code << "    // Vector loop (SVE: variable width)\n";
-//         code << "    while (" << loop_var << " + vl <= " << end_val << ") {\n";
-//         code << "        svfloat32_t yNorm_vec = svld1_f32(pg, yNorms + " << loop_var << ");\n";
-//         code << "        svfloat32_t ip_vec = svld1_f32(pg, ipLine + " << loop_var << ");\n";
-//         code << "        svfloat32_t xNorm_vec = svdup_n_f32(xNorm_scalar);\n";
-//         code << "        svfloat32_t dis_vec = svadd_f32_z(pg, xNorm_vec, yNorm_vec);\n";
-//         code << "        dis_vec = svsub_f32_z(pg, dis_vec, svmul_n_f32_z(pg, ip_vec, 2.0f));\n";
-//         code << "        dis_vec = svmax_n_f32_z(pg, dis_vec, 0.0f);\n";
-//         code << "        svst1_f32(pg, ipLine + " << loop_var << ", dis_vec);\n";
-//         code << "        " << loop_var << " += vl;\n";
-//         code << "    }\n\n";
-//
-//         // Tail with predicate
-//         code << "    // Tail with predicate\n";
-//         code << "    if (" << loop_var << " < " << end_val << ") {\n";
-//         code << "        svbool_t pg_tail = svwhilelt_b32(" << loop_var << ", " << end_val << ");\n";
-//         code << "        svfloat32_t yNorm_vec = svld1_f32(pg_tail, yNorms + " << loop_var << ");\n";
-//         code << "        svfloat32_t ip_vec = svld1_f32(pg_tail, ipLine + " << loop_var << ");\n";
-//         code << "        svfloat32_t xNorm_vec = svdup_n_f32(xNorm_scalar);\n";
-//         code << "        svfloat32_t dis_vec = svadd_f32_z(pg_tail, xNorm_vec, yNorm_vec);\n";
-//         code << "        dis_vec = svsub_f32_z(pg_tail, dis_vec, svmul_n_f32_z(pg_tail, ip_vec, 2.0f));\n";
-//         code << "        dis_vec = svmax_n_f32_z(pg_tail, dis_vec, 0.0f);\n";
-//         code << "        svst1_f32(pg_tail, ipLine + " << loop_var << ", dis_vec);\n";
-//         code << "    }\n";
-//     }
-//
-//     code << "}\n";
-//
-//     return code.str();
-// }
+    auto edges = graph->getIncomingEdges(node->getId());
+    std::shared_ptr<AODNode> init_src = nullptr;
+    for (auto& edge : edges) {
+        if (edge->getProperties().variable_name == "init") {
+            init_src = edge->getSource();
+            break;
+        }
+    }
+
+    if (init_src) rhs_code = generateFromAOD(init_src, graph);
+    else {
+        if (auto* declStmt = llvm::dyn_cast<clang::DeclStmt>(node->getAstStmt())) {
+            if (auto* var = llvm::dyn_cast<clang::VarDecl>(declStmt->getSingleDecl())) {
+                if (var->getInit()) rhs_code = generateFallbackCode(var->getInit());
+            }
+        }
+    }
+
+    if (rhs_code.empty()) return "";
+
+    std::string type = "auto";
+    if (init_src) type = getReturnTypeFromRule(init_src);
+    if (type == "auto") {
+        if (target_architecture == "SVE") type = "svint8_t";
+        else if (target_architecture == "NEON") type = "float32x4_t";
+    }
+
+    if ((rhs_code.find("sv") == std::string::npos && rhs_code.find("v") != 0) || var_name == "i" || var_name == "j") {
+         if (auto* declStmt = llvm::dyn_cast<clang::DeclStmt>(node->getAstStmt())) {
+            if (auto* var = llvm::dyn_cast<clang::VarDecl>(declStmt->getSingleDecl())) type = var->getType().getAsString();
+        }
+    }
+
+    bool is_const = false;
+    if (auto* declStmt = llvm::dyn_cast<clang::DeclStmt>(node->getAstStmt())) {
+        if (auto* var = llvm::dyn_cast<clang::VarDecl>(declStmt->getSingleDecl())) {
+            if (var->getType().isConstQualified()) is_const = true;
+        }
+    }
+    if (is_const && type.find("const") == std::string::npos) type = "const " + type;
+
+    return type + " " + var_name + " = " + rhs_code;
+}
+
+const OptimizationRule* EnhancedCodeGenerator::getRuleForNode(const std::shared_ptr<AODNode>& node) {
+    if (!rule_db) return nullptr;
+    return rule_db->findRuleForOp(node->getProperty("op_name"));
+}
+
+std::string EnhancedCodeGenerator::getReturnTypeFromRule(const std::shared_ptr<AODNode>& node) {
+    auto* rule = getRuleForNode(node);
+    if (rule && rule->target_templates.count(target_architecture)) {
+        auto& tmpl = rule->target_templates.at(target_architecture);
+        if (tmpl.performance_hints.count("return_type")) return tmpl.performance_hints.at("return_type");
+    }
+    return "auto";
+}
+
+std::string EnhancedCodeGenerator::applyReplacements(std::string code, const TransformTemplate& tmpl) {
+    for (const auto& kv : tmpl.arg_replacements) {
+        std::string from = kv.first;
+        std::string to = kv.second;
+        size_t pos = 0;
+        while ((pos = code.find(from, pos)) != std::string::npos) {
+            code.replace(pos, from.length(), to);
+            pos += to.length();
+        }
+    }
+    return code;
+}
+
+std::string EnhancedCodeGenerator::tryApplyRules(const std::shared_ptr<AODNode>& node, const std::shared_ptr<AODGraph>& graph) {
+    return generateFromAOD(node, graph);
+}
+
+std::string EnhancedCodeGenerator::generateFallbackCode(const clang::Stmt* stmt) {
+    if (!stmt) return "";
+    std::string code;
+    llvm::raw_string_ostream os(code);
+    stmt->printPretty(os, nullptr, ast_context.getPrintingPolicy());
+    std::string s = os.str();
+    while (!s.empty() && (s.back() == ';' || s.back() == '\n' || s.back() == ' ')) s.pop_back();
+    return s;
+}
+
+std::string EnhancedCodeGenerator::generateOutputVar(const std::shared_ptr<AODNode>& node) {
+    return "vec_" + std::to_string(node->getId());
+}
 
 } // namespace aodsolve
