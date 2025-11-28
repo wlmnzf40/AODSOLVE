@@ -1,4 +1,3 @@
-
 // CPGAnnotation_v2.cpp - 改进版实现
 #include "analysis/CPGAnnotation.h"
 #include "clang/AST/RecursiveASTVisitor.h"
