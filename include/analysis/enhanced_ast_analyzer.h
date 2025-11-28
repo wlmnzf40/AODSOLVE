@@ -53,7 +53,7 @@ struct SIMDPatternMatch {
     std::string target_instruction_set;
     double confidence_score = 0.0;
     std::string replacement_code;
-    int performance_benefit = 0; // ä¼°è®¡çš„åŠ é€Ÿæ¯”
+    int performance_benefit = 0; // ä¼°è®¡çš„åŠ é€Ÿæ¯”
     std::vector<std::string> dependencies;
 };
 
@@ -171,12 +171,12 @@ public:
     double estimateInlineBenefit(const clang::CallExpr* call);
     std::vector<std::string> getInlineCandidates(const clang::FunctionDecl* func);
 
-    // æ­»ä»£ç æ¶ˆé™¤
+    // æ­»ä»£ç æ¶ˆé™¤
     std::vector<std::string> findDeadCode(const clang::FunctionDecl* func);
     std::vector<std::string> findDeadVariables(const clang::FunctionDecl* func);
     std::vector<std::string> findDeadFunctions();
 
-    // å¸¸é‡ä¼ æ’­
+    // å¸¸é‡ä¼ æ’­
     std::map<std::string, std::string> findConstants(const clang::FunctionDecl* func);
     bool isConstantExpression(const clang::Expr* expr);
 
