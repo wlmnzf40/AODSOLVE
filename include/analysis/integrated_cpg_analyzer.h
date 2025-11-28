@@ -64,27 +64,27 @@ public:
     std::vector<cpg::DataDependency> getDataDependencies(const clang::Stmt* stmt) const;
     std::vector<cpg::ControlDependency> getControlDependencies(const clang::Stmt* stmt) const;
     std::set<std::string> getVariablesAtStatement(const clang::Stmt* stmt) const;
-    std::set<std::string> getDefinitions(const clang::Stmt* stmt, const std::string& var) const;
-    std::set<std::string> getUses(const clang::Stmt* stmt, const std::string& var) const;
-    
+    std::set<const clang::Stmt*> getDefinitions(const clang::Stmt* stmt, const std::string& var) const;
+    std::set<const clang::Stmt*> getUses(const clang::Stmt* stmt, const std::string& var) const;
+
     // 数据流分析
     bool hasDataFlowPath(const clang::Stmt* source, const clang::Stmt* sink, const std::string& var = "") const;
     bool hasControlFlowPath(const clang::Stmt* source, const clang::Stmt* sink) const;
     std::vector<std::vector<clang::Stmt*>> findAllPaths(clang::Stmt* source, clang::Stmt* sink, int max_depth = 100) const;
-    
+
     // 跨函数分析
     std::vector<std::string> traceVariableAcrossFunctions(const std::string& var, const clang::CallExpr* call);
     std::map<std::string, std::string> analyzeParameterFlow(const clang::CallExpr* call);
     std::vector<std::string> identifySideEffects(const clang::FunctionDecl* func);
     bool isPureFunction(const clang::FunctionDecl* func);
-    
+
     // SIMD分析集成
     std::vector<SIMDPatternMatch> findSIMDPatternsInCPG(const clang::FunctionDecl* func);
     std::vector<std::string> identifyVectorizableRegions(const clang::FunctionDecl* func);
     std::vector<std::string> analyzeDataHazardsInSIMD(const clang::FunctionDecl* func);
-    
+
     // 循环分析
-    std::vector<int> findLoopsWithCPG(const clang::FunctionDecl* func);
+    std::vector<int> findLoopsWithCPG(const clang::FunctionDecl* func) const;
     std::vector<std::string> analyzeLoopDependencies(const clang::FunctionDecl* func, int loop_id);
     std::vector<std::string> findLoopCarriedDependencies(int loop_id);
     bool canVectorizeLoop(int loop_id);
