@@ -39,14 +39,6 @@ struct LoopVectorizationPattern {
     int element_size;
 };
 
-// 函数调用上下文
-struct FunctionCallContext {
-    const clang::CallExpr* call_site;
-    const clang::FunctionDecl* callee;
-    std::vector<const clang::Expr*> arguments;
-    std::map<std::string, std::string> param_to_arg_map;
-};
-
 // 函数内联候选
 struct FunctionInlineCandidate {
     const clang::FunctionDecl* func;
@@ -56,93 +48,61 @@ struct FunctionInlineCandidate {
     bool has_simd_equivalent;
     bool is_pure;
     bool can_be_inlined;
+
+    // 修复：添加缺失的成员
     std::string simd_pattern;
-    std::map<std::string, std::string> simd_mapping;
+
     std::set<std::string> modified_variables;
     std::set<std::string> read_variables;
     bool has_control_flow;
 };
 
-// 向量化代码生成器（前向声明）
-class VectorizedCodeGenerator {
-public:
-    std::string generateInitialization(
-        const LoopVectorizationPattern& pattern,
-        const std::string& target_arch);
-
-    std::string generateMainLoop(
-        const LoopVectorizationPattern& pattern,
-        const std::string& target_arch);
-
-    std::string generateTailLoop(
-        const LoopVectorizationPattern& pattern,
-        const std::string& target_arch);
-
-    std::string generateReduction(
-        const LoopVectorizationPattern& pattern,
-        const std::string& target_arch);
+struct FunctionCallContext {
+    const clang::CallExpr* call_site;
+    std::vector<const clang::Expr*> arguments;
 };
 
 // 循环向量化分析器
 class LoopVectorizationAnalyzer {
 private:
     clang::ASTContext& ast_context;
-    cpg::CPGContext* cpg_context;
-
-    // 内部辅助方法
-    bool extractLoopControl(
-        const clang::ForStmt* loop,
-        LoopVectorizationPattern& pattern);
-
-    std::vector<ArrayAccess> analyzeArrayAccesses(
-        const clang::Stmt* body,
-        const std::string& iterator);
-
-    bool detectReductionPattern(
-        const clang::ForStmt* loop,
-        LoopVectorizationPattern& pattern);
-
-    bool hasLoopCarriedDependencies(
-        const LoopVectorizationPattern& pattern);
-
-    bool isVectorizable(
-        const LoopVectorizationPattern& pattern);
 
 public:
-    explicit LoopVectorizationAnalyzer(clang::ASTContext& ctx, cpg::CPGContext* cpg = nullptr)
-        : ast_context(ctx), cpg_context(cpg) {}
+    explicit LoopVectorizationAnalyzer(clang::ASTContext& ctx, cpg::CPGContext* /*cpg*/ = nullptr)
+        : ast_context(ctx) {}
 
-    // 主要分析接口
     LoopVectorizationPattern analyzeLoopVectorizability(const clang::ForStmt* loop);
-
-    // 分析整个函数中的所有循环
     std::vector<LoopVectorizationPattern> analyzeFunction(const clang::FunctionDecl* func);
-
-    // 分析单个循环
     LoopVectorizationPattern analyzeLoop(const clang::ForStmt* loop);
-
-    // 分析循环体中的操作
     std::vector<ScalarOperation> analyzeOperations(const clang::Stmt* body);
 
-    // 生成向量化代码
-    std::string generateVectorizedCode(
-        const LoopVectorizationPattern& pattern,
-        const std::string& target_arch);
+    // 内部辅助方法
+    bool extractLoopControl(const clang::ForStmt* loop, LoopVectorizationPattern& pattern);
+    std::vector<ArrayAccess> analyzeArrayAccesses(const clang::Stmt* body, const std::string& iterator);
+    bool detectReductionPattern(const clang::ForStmt* loop, LoopVectorizationPattern& pattern);
+    bool hasLoopCarriedDependencies(const LoopVectorizationPattern& pattern);
+    bool isVectorizable(const LoopVectorizationPattern& pattern);
+
+    std::string generateVectorizedCode(const LoopVectorizationPattern& pattern, const std::string& target_arch);
 };
 
 // 函数内联分析器
 class FunctionInlineAnalyzer {
-private:
-    clang::ASTContext& ast_context;
-    cpg::CPGContext* cpg_context;
-
 public:
-    explicit FunctionInlineAnalyzer(clang::ASTContext& ctx, cpg::CPGContext* cpg)
-        : ast_context(ctx), cpg_context(cpg) {}
+    explicit FunctionInlineAnalyzer(clang::ASTContext& /*ctx*/, cpg::CPGContext* /*cpg*/)
+        {}
 
     FunctionInlineCandidate analyzeFunctionInlineability(const clang::FunctionDecl* func);
     std::vector<FunctionCallContext> analyzeFunctionCalls(const clang::ForStmt* loop);
     bool isPureFunction(const clang::FunctionDecl* func);
+};
+
+class VectorizedCodeGenerator {
+public:
+    std::string generateInitialization(const LoopVectorizationPattern& pattern, const std::string& target_arch);
+    std::string generateMainLoop(const LoopVectorizationPattern& pattern, const std::string& target_arch);
+    std::string generateTailLoop(const LoopVectorizationPattern& pattern, const std::string& target_arch);
+    std::string generateReduction(const LoopVectorizationPattern& pattern, const std::string& target_arch);
 };
 
 } // namespace aodsolve
